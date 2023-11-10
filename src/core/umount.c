@@ -2,6 +2,9 @@
 /***
   Copyright © 2010 ProFUSION embedded systems
 ***/
+#if HAVE_VALGRIND_MEMCHECK_H
+#include <valgrind/memcheck.h>
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -411,24 +414,78 @@ static int md_list_get(MountPoint **head) {
 }
 
 static int delete_loopback(const char *device) {
-        _cleanup_close_ int fd = -1;
-        int r;
+        _cleanup_close_ int fd = -EBADF;
+        struct loop_info64 info;
 
         assert(device);
 
         fd = open(device, O_RDONLY|O_CLOEXEC);
-        if (fd < 0)
+        if (fd < 0) {
+                log_debug_errno(errno, "Failed to open loopback device %s: %m", device);
                 return errno == ENOENT ? 0 : -errno;
+        }
 
-        r = ioctl(fd, LOOP_CLR_FD, 0);
-        if (r >= 0)
+        /* Loopback block devices don't sync in-flight blocks when we clear the fd, hence sync explicitly
+         * first */
+        if (fsync(fd) < 0)
+                log_debug_errno(errno, "Failed to sync loop block device %s, ignoring: %m", device);
+
+        if (ioctl(fd, LOOP_CLR_FD, 0) < 0) {
+                if (errno == ENXIO) /* Nothing bound, didn't do anything */
+                        return 0;
+
+                if (errno != EBUSY)
+                        return log_debug_errno(errno, "Failed to clear loopback device %s: %m", device);
+
+                if (ioctl(fd, LOOP_GET_STATUS64, &info) < 0) {
+                        if (errno == ENXIO) /* What? Suddenly detached after all? That's fine by us then. */
+                                return 1;
+
+                        log_debug_errno(errno, "Failed to invoke LOOP_GET_STATUS64 on loopback device %s, ignoring: %m", device);
+                        return -EBUSY; /* propagate original error */
+                }
+
+#if HAVE_VALGRIND_MEMCHECK_H
+                VALGRIND_MAKE_MEM_DEFINED(&info, sizeof(info));
+#endif
+
+                if (FLAGS_SET(info.lo_flags, LO_FLAGS_AUTOCLEAR)) /* someone else already set LO_FLAGS_AUTOCLEAR for us? fine by us */
+                        return -EBUSY; /* propagate original error */
+
+                info.lo_flags |= LO_FLAGS_AUTOCLEAR;
+                if (ioctl(fd, LOOP_SET_STATUS64, &info) < 0) {
+                        if (errno == ENXIO) /* Suddenly detached after all? Fine by us */
+                                return 1;
+
+                        log_debug_errno(errno, "Failed to set LO_FLAGS_AUTOCLEAR flag for loop device %s, ignoring: %m", device);
+                } else
+                        log_debug("Successfully set LO_FLAGS_AUTOCLEAR flag for loop device %s.", device);
+
+                return -EBUSY;
+        }
+
+        if (ioctl(fd, LOOP_GET_STATUS64, &info) < 0) {
+                /* If the LOOP_CLR_FD above succeeded we'll see ENXIO here. */
+                if (errno == ENXIO)
+                        log_debug("Successfully detached loopback device %s.", device);
+                else
+                        log_debug_errno(errno, "Failed to invoke LOOP_GET_STATUS64 on loopback device %s, ignoring: %m", device); /* the LOOP_CLR_FD at least worked, let's hope for the best */
+
                 return 1;
+        }
 
-        /* ENXIO: not bound, so no error */
-        if (errno == ENXIO)
-                return 0;
+#if HAVE_VALGRIND_MEMCHECK_H
+        VALGRIND_MAKE_MEM_DEFINED(&info, sizeof(info));
+#endif
 
-        return -errno;
+        /* Linux makes LOOP_CLR_FD succeed whenever LO_FLAGS_AUTOCLEAR is set without actually doing
+         * anything. Very confusing. Let's hence not claim we did anything in this case. */
+        if (FLAGS_SET(info.lo_flags, LO_FLAGS_AUTOCLEAR))
+                log_debug("Successfully called LOOP_CLR_FD on a loopback device %s with autoclear set, which is a NOP.", device);
+        else
+                log_debug("Weird, LOOP_CLR_FD succeeded but the device is still attached on %s.", device);
+
+        return -EBUSY; /* Nothing changed, the device is still attached, hence it apparently is still busy */
 }
 
 static int delete_dm(dev_t devnum) {
