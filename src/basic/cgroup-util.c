@@ -2341,12 +2341,24 @@ int cg_mask_from_string(const char *value, CGroupMask *mask) {
 }
 
 int cg_mask_supported(CGroupMask *ret) {
+        static int cpu_controller_disable = -1;
         CGroupMask mask = 0;
         int r;
 
         /* Determines the mask of supported cgroup controllers. Only
          * includes controllers we can make sense of and that are
          * actually accessible. */
+
+        /* RHEL-only hack: check if CPU controller should be forcefully disabled. */
+        if (cpu_controller_disable < 0) {
+                bool b;
+
+                r = proc_cmdline_get_bool("systemd_rhel_cpu_controller_disable", &b);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to parse systemd_rhel_cpu_controller_disable kernel command line argument, ignoring: %m");
+
+                cpu_controller_disable = !!b;
+        }
 
         r = cg_all_unified();
         if (r < 0)
@@ -2379,6 +2391,10 @@ int cg_mask_supported(CGroupMask *ret) {
                  * everything else off. */
                 mask &= CGROUP_MASK_CPU | CGROUP_MASK_MEMORY | CGROUP_MASK_IO | CGROUP_MASK_PIDS | CGROUP_MASK_CPUSET;
 
+                /* RHEL-only hack: disable CPU controller if requested via kernel command line. */
+                if (cpu_controller_disable)
+                        mask &= ~CGROUP_MASK_CPU;
+
         } else {
                 CGroupController c;
 
@@ -2389,6 +2405,11 @@ int cg_mask_supported(CGroupMask *ret) {
                         const char *n;
 
                         if (c == CGROUP_CONTROLLER_CPUSET)
+                                continue;
+
+                        /* RHEL-only hack: skip cpu and cpuacct controllers if disabled via kernel command line. */
+                        if (cpu_controller_disable &&
+                            (c == CGROUP_CONTROLLER_CPU || c == CGROUP_CONTROLLER_CPUACCT))
                                 continue;
 
                         n = cgroup_controller_to_string(c);
